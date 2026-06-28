@@ -10,7 +10,7 @@
     <Description>Shared Roslyn workspace layer for RoslynMcp (stdio MCP) and IDE hosts: code actions, rename, diagnostics, navigation.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageId>AIGuiders.RoslynMcp.Core</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Authors>LonelySoul; AIGuiders</Authors>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageProjectUrl>https://github.com/AI-Guiders/roslyn-mcp-core</PackageProjectUrl>
