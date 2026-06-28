@@ -1,0 +1,67 @@
+# Trusted Publishing: nuget.org ↔ GitHub OIDC (без длинного API key).
+# На nuget.org: Trusted Publishing → Owner AI-Guiders, Repo roslyn-mcp-core,
+# Workflow file: publish-nuget.yml. Учётная запись публикации: LonelySoul.
+name: Publish NuGet
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer без префикса v (например 0.1.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  DOTNET_VERSION: '10.0.x'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Resolve package version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$V" ]; then
+            echo "Empty version" >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Pack
+        run: |
+          dotnet pack RoslynMcp.Core.csproj -c Release -o ./nupkg \
+            -p:Version=${{ steps.ver.outputs.version }} \
+            -p:PackageVersion=${{ steps.ver.outputs.version }}
+
+      - name: NuGet login (OIDC → short-lived API key)
+        uses: NuGet/login@v1
+        id: nuget_login
+        with:
+          user: LonelySoul
+
+      - name: Push to nuget.org
+        run: >
+          dotnet nuget push ./nupkg/*.nupkg
+          --api-key "${{ steps.nuget_login.outputs.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
