@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using System.Globalization;
 using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Host;
 using Microsoft.CodeAnalysis.MSBuild;
@@ -9,7 +10,10 @@ using Microsoft.CodeAnalysis.Text;
 
 namespace RoslynMcp.ServiceLayer;
 
-/// <summary>Диагностики компиляции (ошибки, предупреждения) по solution/project. Опционально — только по одному файлу.</summary>
+/// <summary>
+/// Диагностики: scope=syntax (ParseText, без MSBuild, parallel-safe) или scope=project (MSBuild, serialized).
+/// Default: file_path set → syntax; иначе project.
+/// </summary>
 public static class GetDiagnostics
 {
     public const string Kind = "roslyn.get_diagnostics";
@@ -29,6 +33,26 @@ public static class GetDiagnostics
             || normalizedPath.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar, StringComparison.Ordinal)
             || normalizedPath.Contains("/obj/", StringComparison.Ordinal)
             || normalizedPath.Contains("/bin/", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// scope null → file_path? syntax : project.
+    /// Explicit: syntax|parse|file / project|msbuild|full|semantic.
+    /// </summary>
+    public static string ResolveScope(string? scope, string? filePath)
+    {
+        if (!string.IsNullOrWhiteSpace(scope))
+        {
+            return scope.Trim().ToLowerInvariant() switch
+            {
+                "syntax" or "parse" or "file" => "syntax",
+                "project" or "msbuild" or "full" or "semantic" => "project",
+                _ => throw new ArgumentException(
+                    "scope must be syntax|project (aliases: parse|file / msbuild|full|semantic).")
+            };
+        }
+
+        return string.IsNullOrWhiteSpace(filePath) ? "project" : "syntax";
     }
 
     /// <summary>
@@ -161,14 +185,82 @@ public static class GetDiagnostics
         return (totalAfterPath, excludedSeverityNone, excludedSuppress);
     }
 
+    public static Task<string> GetDiagnosticsAsync(
+        string solutionOrProjectPath,
+        string? filePath,
+        CancellationToken cancellationToken = default) =>
+        GetDiagnosticsAsync(solutionOrProjectPath, filePath, scope: null, sourceText: null, cancellationToken);
+
+    /// <param name="scope">null → file_path? syntax : project. syntax = ParseText only; project = MSBuild (serialized).</param>
+    /// <param name="sourceText">Optional buffer text for scope=syntax.</param>
     public static async Task<string> GetDiagnosticsAsync(
         string solutionOrProjectPath,
         string? filePath,
+        string? scope,
+        string? sourceText,
         CancellationToken cancellationToken = default)
     {
+        var resolvedScope = ResolveScope(scope, filePath);
+        if (resolvedScope == "syntax")
+            return GetSyntaxDiagnostics(solutionOrProjectPath, filePath, sourceText, cancellationToken);
+
         if (!File.Exists(solutionOrProjectPath))
             return ToolStepJson.Fail(Kind, $"solution/project not found: {solutionOrProjectPath}");
 
+        await MsBuildWorkspaceGate.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await GetProjectDiagnosticsUnlockedAsync(solutionOrProjectPath, filePath, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            MsBuildWorkspaceGate.Gate.Release();
+        }
+    }
+
+    private static string GetSyntaxDiagnostics(
+        string solutionOrProjectPath,
+        string? filePath,
+        string? sourceText,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+            return ToolStepJson.Fail(Kind, "scope=syntax requires file_path");
+
+        if (!File.Exists(filePath) && string.IsNullOrEmpty(sourceText))
+            return ToolStepJson.Fail(Kind, $"file not found: {filePath}");
+
+        var targetPath = NormalizePath(filePath);
+        var text = sourceText ?? File.ReadAllText(filePath);
+        var tree = CSharpSyntaxTree.ParseText(
+            text,
+            path: targetPath,
+            cancellationToken: cancellationToken);
+
+        var allDiagnostics = new List<(Diagnostic d, DiagnosticSeverity effectiveSeverity)>();
+        foreach (var d in tree.GetDiagnostics(cancellationToken))
+        {
+            if (d.Severity == DiagnosticSeverity.Hidden)
+                continue;
+            allDiagnostics.Add((d, d.Severity));
+        }
+
+        return FormatDiagnosticsPayload(
+            solutionOrProjectPath,
+            targetPath,
+            scope: "syntax",
+            allDiagnostics,
+            totalAfterPath: allDiagnostics.Count,
+            excludedSeverityNone: 0,
+            excludedSuppress: 0);
+    }
+
+    private static async Task<string> GetProjectDiagnosticsUnlockedAsync(
+        string solutionOrProjectPath,
+        string? filePath,
+        CancellationToken cancellationToken)
+    {
         string? targetPath = null;
         if (!string.IsNullOrWhiteSpace(filePath))
         {
@@ -232,6 +324,25 @@ public static class GetDiagnostics
             }
         }
 
+        return FormatDiagnosticsPayload(
+            solutionOrProjectPath,
+            targetPath,
+            scope: "project",
+            allDiagnostics,
+            totalAfterPath,
+            excludedSeverityNone,
+            excludedSuppress);
+    }
+
+    private static string FormatDiagnosticsPayload(
+        string workspacePath,
+        string? targetPath,
+        string scope,
+        List<(Diagnostic d, DiagnosticSeverity effectiveSeverity)> allDiagnostics,
+        int totalAfterPath,
+        int excludedSeverityNone,
+        int excludedSuppress)
+    {
         var items = new List<object>();
         foreach (var (d, effectiveSeverity) in allDiagnostics.OrderBy(x => x.d.Location.SourceTree?.FilePath ?? "").ThenBy(x => x.d.Location.SourceSpan.Start))
         {
@@ -266,9 +377,10 @@ public static class GetDiagnostics
 
         var errorCount = allDiagnostics.Count(x => x.effectiveSeverity == DiagnosticSeverity.Error);
 
-        return ToolStepJson.Ok(Kind, $"shown={allDiagnostics.Count} errors={errorCount}", new
+        return ToolStepJson.Ok(Kind, $"scope={scope} shown={allDiagnostics.Count} errors={errorCount}", new
         {
-            workspace = solutionOrProjectPath,
+            scope,
+            workspace = workspacePath,
             file = targetPath,
             total_after_path = totalAfterPath,
             excluded_severity_none = excludedSeverityNone,
