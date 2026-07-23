@@ -11,7 +11,8 @@ using Microsoft.CodeAnalysis.Text;
 namespace RoslynMcp.ServiceLayer;
 
 /// <summary>
-/// Диагностики: scope=syntax (ParseText, без MSBuild, parallel-safe) или scope=project (MSBuild, serialized).
+/// Диагностики: scope=syntax|file (ParseText) / project|solution (MSBuild via <see cref="MsBuildWorkspaceHost"/>).
+/// Results cached by path+fingerprint until invalidate (file stable ⇒ diag stable).
 /// Default: file_path set → syntax; иначе project.
 /// </summary>
 public static class GetDiagnostics
@@ -47,8 +48,9 @@ public static class GetDiagnostics
             {
                 "syntax" or "parse" or "file" => "syntax",
                 "project" or "msbuild" or "full" or "semantic" => "project",
+                "solution" or "sln" => "solution",
                 _ => throw new ArgumentException(
-                    "scope must be syntax|project (aliases: parse|file / msbuild|full|semantic).")
+                    "scope must be syntax|project|solution (aliases: parse|file / msbuild|full|semantic / sln).")
             };
         }
 
@@ -207,16 +209,10 @@ public static class GetDiagnostics
         if (!File.Exists(solutionOrProjectPath))
             return ToolStepJson.Fail(Kind, $"solution/project not found: {solutionOrProjectPath}");
 
-        await MsBuildWorkspaceGate.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            return await GetProjectDiagnosticsUnlockedAsync(solutionOrProjectPath, filePath, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        finally
-        {
-            MsBuildWorkspaceGate.Gate.Release();
-        }
+        // project + solution: same MSBuild path; solution prefers .sln key when caller passes it.
+        return await GetProjectDiagnosticsCachedAsync(
+                solutionOrProjectPath, filePath, resolvedScope, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private static string GetSyntaxDiagnostics(
@@ -233,6 +229,10 @@ public static class GetDiagnostics
 
         var targetPath = NormalizePath(filePath);
         var text = sourceText ?? File.ReadAllText(filePath);
+        var fingerprint = DiagnosticsResultCache.FingerprintText(text);
+        if (DiagnosticsResultCache.TryGet("syntax", targetPath, fingerprint, out var cached))
+            return MarkCacheHit(cached);
+
         var tree = CSharpSyntaxTree.ParseText(
             text,
             path: targetPath,
@@ -246,29 +246,55 @@ public static class GetDiagnostics
             allDiagnostics.Add((d, d.Severity));
         }
 
-        return FormatDiagnosticsPayload(
+        var payload = FormatDiagnosticsPayload(
             solutionOrProjectPath,
             targetPath,
             scope: "syntax",
             allDiagnostics,
             totalAfterPath: allDiagnostics.Count,
             excludedSeverityNone: 0,
-            excludedSuppress: 0);
+            excludedSuppress: 0,
+            cache: "miss");
+        DiagnosticsResultCache.Set("syntax", targetPath, fingerprint, payload);
+        return payload;
     }
 
-    private static async Task<string> GetProjectDiagnosticsUnlockedAsync(
+    private static async Task<string> GetProjectDiagnosticsCachedAsync(
         string solutionOrProjectPath,
         string? filePath,
+        string resolvedScope,
         CancellationToken cancellationToken)
     {
         string? targetPath = null;
+        var fingerprintParts = new List<string> { DiagnosticsResultCache.FingerprintFile(solutionOrProjectPath) };
         if (!string.IsNullOrWhiteSpace(filePath))
         {
             if (!File.Exists(filePath))
                 return ToolStepJson.Fail(Kind, $"file not found: {filePath}");
             targetPath = NormalizePath(filePath);
+            fingerprintParts.Add(DiagnosticsResultCache.FingerprintFile(filePath));
         }
 
+        var pathKey = targetPath ?? NormalizePath(solutionOrProjectPath);
+        var fingerprint = string.Join('|', fingerprintParts);
+        if (DiagnosticsResultCache.TryGet(resolvedScope, pathKey, fingerprint, out var cached))
+            return MarkCacheHit(cached);
+
+        var payload = await GetProjectDiagnosticsComputeAsync(
+                solutionOrProjectPath, targetPath, resolvedScope, cancellationToken)
+            .ConfigureAwait(false);
+        if (!payload.Contains("\"ok\":false", StringComparison.Ordinal)
+            && !payload.Contains("\"ok\": false", StringComparison.Ordinal))
+            DiagnosticsResultCache.Set(resolvedScope, pathKey, fingerprint, payload);
+        return payload;
+    }
+
+    private static async Task<string> GetProjectDiagnosticsComputeAsync(
+        string solutionOrProjectPath,
+        string? targetPath,
+        string resolvedScope,
+        CancellationToken cancellationToken)
+    {
         var allDiagnostics = new List<(Diagnostic d, DiagnosticSeverity effectiveSeverity)>();
         var totalAfterPath = 0;
         var excludedSeverityNone = 0;
@@ -281,58 +307,71 @@ public static class GetDiagnostics
             if (projectPaths.Count == 0)
                 return ToolStepJson.Fail(Kind, ".slnx contains no valid project paths or files not found");
 
-            foreach (var projectPath in projectPaths)
+            // slnx: still per-project open (no single MSBuild solution object).
+            await MsBuildWorkspaceGate.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var workspace = MSBuildWorkspace.Create(RoslynMcpWorkspaceProperties.MsBuild);
-                try
+                foreach (var projectPath in projectPaths)
                 {
-                    var solution = await WorkspaceOpen.OpenSolutionOrProjectAsync(workspace, projectPath, cancellationToken).ConfigureAwait(false);
-                    if (solution is not null)
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var workspace = MSBuildWorkspace.Create(RoslynMcpWorkspaceProperties.MsBuild);
+                    try
                     {
-                        var (t, n, s) = await CollectDiagnosticsFromSolution(workspace, solution, targetPath, allDiagnostics, cancellationToken).ConfigureAwait(false);
-                        totalAfterPath += t;
-                        excludedSeverityNone += n;
-                        excludedSuppress += s;
+                        var solution = await WorkspaceOpen.OpenSolutionOrProjectAsync(workspace, projectPath, cancellationToken).ConfigureAwait(false);
+                        if (solution is not null)
+                        {
+                            var (t, n, s) = await CollectDiagnosticsFromSolution(workspace, solution, targetPath, allDiagnostics, cancellationToken).ConfigureAwait(false);
+                            totalAfterPath += t;
+                            excludedSeverityNone += n;
+                            excludedSuppress += s;
+                        }
+                    }
+                    finally
+                    {
+                        workspace.Dispose();
                     }
                 }
-                finally
-                {
-                    workspace.Dispose();
-                }
+            }
+            finally
+            {
+                MsBuildWorkspaceGate.Gate.Release();
             }
         }
         else
         {
-            Solution? solution = null;
             try
             {
-                var workspace = MSBuildWorkspace.Create(RoslynMcpWorkspaceProperties.MsBuild);
-                solution = await WorkspaceOpen.OpenSolutionOrProjectAsync(workspace, solutionOrProjectPath, cancellationToken).ConfigureAwait(false);
-
-                if (solution is null)
-                    return ToolStepJson.Fail(Kind, "failed to open solution");
-
-                var (t, n, s) = await CollectDiagnosticsFromSolution(workspace, solution, targetPath, allDiagnostics, cancellationToken).ConfigureAwait(false);
+                var (t, n, s) = await MsBuildWorkspaceHost.RunAsync(
+                    solutionOrProjectPath,
+                    async (workspace, solution, ct) =>
+                        await CollectDiagnosticsFromSolution(workspace, solution, targetPath, allDiagnostics, ct)
+                            .ConfigureAwait(false),
+                    cancellationToken).ConfigureAwait(false);
                 totalAfterPath += t;
                 excludedSeverityNone += n;
                 excludedSuppress += s;
             }
-            finally
+            catch (InvalidOperationException ex)
             {
-                solution?.Workspace.Dispose();
+                return ToolStepJson.Fail(Kind, ex.Message);
             }
         }
 
         return FormatDiagnosticsPayload(
             solutionOrProjectPath,
             targetPath,
-            scope: "project",
+            scope: resolvedScope,
             allDiagnostics,
             totalAfterPath,
             excludedSeverityNone,
-            excludedSuppress);
+            excludedSuppress,
+            cache: "miss");
     }
+
+    static string MarkCacheHit(string payloadJson) =>
+        payloadJson
+            .Replace("\"cache\":\"miss\"", "\"cache\":\"hit\"", StringComparison.Ordinal)
+            .Replace("cache=miss", "cache=hit", StringComparison.Ordinal);
 
     private static string FormatDiagnosticsPayload(
         string workspacePath,
@@ -341,7 +380,8 @@ public static class GetDiagnostics
         List<(Diagnostic d, DiagnosticSeverity effectiveSeverity)> allDiagnostics,
         int totalAfterPath,
         int excludedSeverityNone,
-        int excludedSuppress)
+        int excludedSuppress,
+        string cache = "miss")
     {
         var items = new List<object>();
         foreach (var (d, effectiveSeverity) in allDiagnostics.OrderBy(x => x.d.Location.SourceTree?.FilePath ?? "").ThenBy(x => x.d.Location.SourceSpan.Start))
@@ -377,9 +417,10 @@ public static class GetDiagnostics
 
         var errorCount = allDiagnostics.Count(x => x.effectiveSeverity == DiagnosticSeverity.Error);
 
-        return ToolStepJson.Ok(Kind, $"scope={scope} shown={allDiagnostics.Count} errors={errorCount}", new
+        return ToolStepJson.Ok(Kind, $"scope={scope} shown={allDiagnostics.Count} errors={errorCount} cache={cache}", new
         {
             scope,
+            cache,
             workspace = workspacePath,
             file = targetPath,
             total_after_path = totalAfterPath,
