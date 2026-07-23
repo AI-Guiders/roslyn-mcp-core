@@ -4,3 +4,5 @@ nupkg/
 .vs/
 *.user
 *.suo
+
+.cascade-ide/
