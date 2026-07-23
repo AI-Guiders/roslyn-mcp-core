@@ -14,7 +14,8 @@ internal static class BundledWorkspaceNavigationPresets
   "peers_only": { "include_kinds": ["partial_peer", "project_peer"] },
   "no_namespace_noise": { "exclude_kinds": ["same_namespace", "same_directory"] },
   "tests_and_peers": { "include_kinds": ["partial_peer", "project_peer", "test_counterpart"] },
-  "structure_only": { "include_kinds": ["partial_peer", "project_peer", "xaml_codebehind_pair", "same_directory"] }
+  "structure_only": { "include_kinds": ["partial_peer", "project_peer", "xaml_codebehind_pair", "same_directory"] },
+  "explore_default": { "exclude_kinds": ["project_peer"] }
 }
 """;
 }

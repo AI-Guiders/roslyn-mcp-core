@@ -18,6 +18,8 @@ Requires **.NET 10** and a solution or project path (`.sln` / `.csproj`) for wor
 
 | Area | Entry points |
 |------|----------------|
+| Format | `FormatDocument.FormatAsync` → `ToolStepJson` (`kind=roslyn.format`) |
+| Cleanup | `CleanupDocument.CleanupAsync` → `ToolStepJson` (`kind=roslyn.cleanup`) |
 | Code actions | `CodeActions.GetCodeActionsAsync`, `ApplyCodeActionAsync`; editor: `ListForEditorAsync`, `ApplyForEditorAsync` |
 | Rename | `RenameSymbol.RenameAsync`; editor: `RenameForEditorAsync` |
 | Diagnostics | `GetDiagnostics` |

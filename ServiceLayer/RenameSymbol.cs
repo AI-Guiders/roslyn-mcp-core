@@ -1,15 +1,17 @@
-using System.Linq;
-using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Rename;
-using Microsoft.CodeAnalysis.Text;
 
 namespace RoslynMcp.ServiceLayer;
 
-/// <summary>Переименование символа по solution. preview (apply=false) — только список изменений; apply=true — запись в файлы.</summary>
+/// <summary>
+/// Solution-wide symbol rename. preview (<c>apply=false</c>) — list of changes only; <c>apply=true</c> — write files.
+/// Returns <see cref="ToolStepJson"/> (<c>kind=roslyn.rename</c>).
+/// </summary>
 public static partial class RenameSymbol
 {
+    public const string Kind = "roslyn.rename";
+
     private static string NormalizePath(string path)
     {
         var p = Path.GetFullPath(path.Trim());
@@ -80,11 +82,11 @@ public static partial class RenameSymbol
         CancellationToken cancellationToken = default)
     {
         if (!File.Exists(solutionOrProjectPath))
-            return $"Error: solution/project not found: {solutionOrProjectPath}";
+            return ToolStepJson.Fail(Kind, $"solution/project not found: {solutionOrProjectPath}");
         if (!File.Exists(filePath))
-            return $"Error: file not found: {filePath}";
+            return ToolStepJson.Fail(Kind, $"file not found: {filePath}");
         if (string.IsNullOrWhiteSpace(newName))
-            return "Error: new_name is required.";
+            return ToolStepJson.Fail(Kind, "new_name is required.");
 
         var targetPath = NormalizePath(filePath);
         Solution? solution = null;
@@ -94,27 +96,27 @@ public static partial class RenameSymbol
             solution = await WorkspaceOpen.OpenSolutionOrProjectAsync(workspace, solutionOrProjectPath, cancellationToken).ConfigureAwait(false);
 
             if (solution is null)
-                return "Error: failed to open solution.";
+                return ToolStepJson.Fail(Kind, "failed to open solution.");
 
             var document = solution.Projects
                 .SelectMany(p => p.Documents)
                 .FirstOrDefault(d => string.Equals(NormalizePath(d.FilePath ?? ""), targetPath, StringComparison.OrdinalIgnoreCase));
             if (document is null)
-                return $"Error: file not found in solution: {filePath}";
+                return ToolStepJson.Fail(Kind, $"file not found in solution: {filePath}");
 
             var root = await document.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
             var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
             if (root is null || semanticModel is null)
-                return "Error: could not get syntax/semantic model.";
+                return ToolStepJson.Fail(Kind, "could not get syntax/semantic model.");
 
             var sourceText = await document.GetTextAsync(cancellationToken).ConfigureAwait(false);
             var lines = sourceText.Lines;
             if (line < 1 || line > lines.Count)
-                return $"Error: line {line} out of range (1..{lines.Count}).";
+                return ToolStepJson.Fail(Kind, $"line {line} out of range (1..{lines.Count}).");
             var lineInfo = lines[line - 1];
             var columnIndex = column - 1;
             if (columnIndex < 0)
-                return $"Error: column {column} must be >= 1.";
+                return ToolStepJson.Fail(Kind, $"column {column} must be >= 1.");
             var lineLen = lineInfo.Span.Length;
             var position = lineLen == 0 ? lineInfo.Start : lineInfo.Start + Math.Min(columnIndex, lineLen);
 
@@ -129,17 +131,11 @@ public static partial class RenameSymbol
                 node = node.Parent;
             }
             if (symbol is null)
-                return $"No symbol at {filePath}:{line}:{column}.";
+                return ToolStepJson.Fail(Kind, $"No symbol at {filePath}:{line}:{column}.");
 
             var oldTypeName = symbol.Name;
             var options = new SymbolRenameOptions(renameOverloads, renameInStrings, renameInComments, renameFile);
             var newSolution = await Renamer.RenameSymbolAsync(solution, symbol, options, newName, cancellationToken).ConfigureAwait(false);
-
-            var sb = new StringBuilder();
-            var docPath = document.FilePath ?? filePath;
-            sb.AppendLineInvariant($"# Document: {docPath} (total_lines={lines.Count}, line_{line}_length={lineLen})");
-            sb.AppendLineInvariant($"# Rename {symbol.Kind} {oldTypeName} → {newName}");
-            sb.AppendLine();
 
             var changed = new List<Document>();
             foreach (var project in newSolution.Projects)
@@ -159,24 +155,23 @@ public static partial class RenameSymbol
             }
 
             List<(string OldPath, string NewPath)>? partialRenames = null;
+            string? partialNote = null;
             if (renamePartialTypeFiles)
             {
                 if (!IsTopLevelNamedTypeForPartialFileRename(symbol))
                 {
-                    sb.AppendLine("# rename_partial_type_files: skipped (not a top-level class/struct/interface).");
-                    sb.AppendLine();
+                    partialNote = "rename_partial_type_files skipped (not a top-level class/struct/interface).";
                 }
                 else
                 {
                     var proj = newSolution.GetProject(document.Project.Id);
-                    partialRenames = [];
                     if (proj is null)
                     {
-                        sb.AppendLine("# rename_partial_type_files: skipped (project not found in new solution).");
-                        sb.AppendLine();
+                        partialNote = "rename_partial_type_files skipped (project not found in new solution).";
                     }
                     else
                     {
+                        partialRenames = [];
                         foreach (var doc in proj.Documents)
                         {
                             var p = doc.FilePath;
@@ -187,93 +182,103 @@ public static partial class RenameSymbol
                         }
 
                         if (partialRenames.Count == 0)
-                        {
-                            sb.AppendLine("# rename_partial_type_files: no matching TypeName.cs / TypeName.*.cs files in project.");
-                            sb.AppendLine();
-                        }
-                        else
-                        {
-                            sb.AppendLine("# rename_partial_type_files (disk path renames after symbol rename):");
-                            foreach (var (o, n) in partialRenames)
-                                sb.AppendLineInvariant($"  {o} → {n}");
-                            sb.AppendLine();
-                        }
+                            partialNote = "rename_partial_type_files: no matching TypeName.cs / TypeName.*.cs files in project.";
                     }
                 }
             }
 
+            object? PartialRenameData() =>
+                partialRenames is { Count: > 0 }
+                    ? partialRenames.Select(x => new { from = x.OldPath, to = x.NewPath }).ToList()
+                    : null;
+
+            object OkData(string summary, IReadOnlyList<string> files) => new
+            {
+                apply,
+                old_name = oldTypeName,
+                new_name = newName,
+                symbol_kind = symbol.Kind.ToString(),
+                files,
+                partial_renames = PartialRenameData(),
+                summary
+            };
+
             if (changed.Count == 0)
             {
-                sb.AppendLine("(no text changes)");
-                return sb.ToString();
+                var summary = string.IsNullOrEmpty(partialNote)
+                    ? "No text changes."
+                    : $"No text changes. {partialNote}";
+                return ToolStepJson.Ok(Kind, summary, OkData(summary, []));
             }
 
-            var applied = new List<string>();
+            var files = new List<string>(changed.Count);
             foreach (var doc in changed)
             {
                 if (apply)
                 {
                     var newText = await doc.GetTextAsync(cancellationToken).ConfigureAwait(false);
                     await File.WriteAllTextAsync(doc.FilePath!, newText.ToString(), cancellationToken).ConfigureAwait(false);
-                    applied.Add(doc.FilePath!);
                 }
-                else
-                {
-                    sb.AppendLine(doc.FilePath);
-                }
+
+                files.Add(doc.FilePath!);
             }
 
             if (apply)
             {
-                sb.AppendLine("Applied text to:");
-                foreach (var p in applied)
-                    sb.AppendLine("  " + p);
+                var notes = new List<string>();
+                if (!string.IsNullOrEmpty(partialNote))
+                    notes.Add(partialNote);
 
                 if (renamePartialTypeFiles && partialRenames is { Count: > 0 })
                 {
-                    sb.AppendLine("Partial file renames:");
                     foreach (var (oldPath, newPath) in partialRenames.OrderByDescending(x => x.OldPath.Length))
                     {
                         try
                         {
                             if (!File.Exists(oldPath) && File.Exists(newPath))
                             {
-                                sb.AppendLineInvariant($"  (already at target, skip) {newPath}");
+                                notes.Add($"(already at target, skip) {newPath}");
                                 continue;
                             }
 
                             if (!File.Exists(oldPath))
                             {
-                                sb.AppendLineInvariant($"  Warning: source missing, skip: {oldPath}");
+                                notes.Add($"source missing, skip: {oldPath}");
                                 continue;
                             }
 
                             if (File.Exists(newPath))
                             {
-                                sb.AppendLineInvariant($"  Error: target exists: {newPath}");
+                                notes.Add($"target exists: {newPath}");
                                 continue;
                             }
 
                             File.Move(oldPath, newPath);
-                            sb.AppendLineInvariant($"  {oldPath} → {newPath}");
+                            notes.Add($"{oldPath} → {newPath}");
                         }
                         catch (Exception ex)
                         {
-                            sb.AppendLineInvariant($"  Error ({oldPath}): {ex.Message}");
+                            notes.Add($"{oldPath}: {ex.Message}");
                         }
                     }
                 }
-            }
-            else
-            {
-                sb.AppendLine().AppendLineInvariant($"Total: {changed.Count} file(s). Call with apply: true to write.");
+
+                var summary = notes.Count == 0
+                    ? $"Renamed {oldTypeName} → {newName}. Applied text to {files.Count} file(s)."
+                    : $"Renamed {oldTypeName} → {newName}. Applied text to {files.Count} file(s). {string.Join(" ", notes)}";
+                return ToolStepJson.Ok(Kind, summary, OkData(summary, files));
             }
 
-            return sb.ToString();
+            {
+                var summary = string.IsNullOrEmpty(partialNote)
+                    ? $"Would rename {oldTypeName} → {newName} in {files.Count} file(s). Call with apply: true to write."
+                    : $"Would rename {oldTypeName} → {newName} in {files.Count} file(s). Call with apply: true to write. {partialNote}";
+                return ToolStepJson.Ok(Kind, summary, OkData(summary, files));
+            }
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("slnx") || ex.Message.Contains("Slnx"))
         {
-            return "Error: .slnx format is not supported. Use .sln or open by .csproj.";
+            return ToolStepJson.Fail(Kind, ".slnx format is not supported. Use .sln or open by .csproj.");
         }
         finally
         {

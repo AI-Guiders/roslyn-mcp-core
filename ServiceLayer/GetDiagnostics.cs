@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Globalization;
-using System.Text;
 using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
@@ -13,6 +12,8 @@ namespace RoslynMcp.ServiceLayer;
 /// <summary>Диагностики компиляции (ошибки, предупреждения) по solution/project. Опционально — только по одному файлу.</summary>
 public static class GetDiagnostics
 {
+    public const string Kind = "roslyn.get_diagnostics";
+
     private static string NormalizePath(string path)
     {
         var p = Path.GetFullPath(path.Trim());
@@ -166,13 +167,13 @@ public static class GetDiagnostics
         CancellationToken cancellationToken = default)
     {
         if (!File.Exists(solutionOrProjectPath))
-            return $"Error: solution/project not found: {solutionOrProjectPath}";
+            return ToolStepJson.Fail(Kind, $"solution/project not found: {solutionOrProjectPath}");
 
         string? targetPath = null;
         if (!string.IsNullOrWhiteSpace(filePath))
         {
             if (!File.Exists(filePath))
-                return $"Error: file not found: {filePath}";
+                return ToolStepJson.Fail(Kind, $"file not found: {filePath}");
             targetPath = NormalizePath(filePath);
         }
 
@@ -186,7 +187,7 @@ public static class GetDiagnostics
         {
             var projectPaths = GetProjectPathsFromSlnx(solutionOrProjectPath);
             if (projectPaths.Count == 0)
-                return "Error: .slnx contains no valid project paths or files not found.";
+                return ToolStepJson.Fail(Kind, ".slnx contains no valid project paths or files not found");
 
             foreach (var projectPath in projectPaths)
             {
@@ -218,7 +219,7 @@ public static class GetDiagnostics
                 solution = await WorkspaceOpen.OpenSolutionOrProjectAsync(workspace, solutionOrProjectPath, cancellationToken).ConfigureAwait(false);
 
                 if (solution is null)
-                    return "Error: failed to open solution.";
+                    return ToolStepJson.Fail(Kind, "failed to open solution");
 
                 var (t, n, s) = await CollectDiagnosticsFromSolution(workspace, solution, targetPath, allDiagnostics, cancellationToken).ConfigureAwait(false);
                 totalAfterPath += t;
@@ -231,49 +232,50 @@ public static class GetDiagnostics
             }
         }
 
-        var sb = new StringBuilder();
-            sb.AppendLine("# Diagnostics (compiler + analyzers)");
-            if (string.Equals(Path.GetExtension(solutionOrProjectPath), ".slnx", StringComparison.OrdinalIgnoreCase))
-                sb.AppendLineInvariant($"# Solution: {solutionOrProjectPath}");
-            sb.AppendLine("# Filtered by .editorconfig (severity = none) and CompilationOptions (Suppress); severity = effective (incl. TreatWarningsAsErrors).");
-            sb.AppendLineInvariant($"# Total (after path filter): {totalAfterPath}; excluded: severity=none {excludedSeverityNone}, Suppress {excludedSuppress}; shown: {allDiagnostics.Count}");
-            if (targetPath is not null)
-                sb.AppendLineInvariant($"# File: {filePath}");
-            sb.AppendLine("# Format: file:line:column severity id — message");
-            sb.AppendLine();
-
-            foreach (var (d, effectiveSeverity) in allDiagnostics.OrderBy(x => x.d.Location.SourceTree?.FilePath ?? "").ThenBy(x => x.d.Location.SourceSpan.Start))
+        var items = new List<object>();
+        foreach (var (d, effectiveSeverity) in allDiagnostics.OrderBy(x => x.d.Location.SourceTree?.FilePath ?? "").ThenBy(x => x.d.Location.SourceSpan.Start))
+        {
+            var tree = d.Location.SourceTree;
+            var file = tree?.FilePath ?? "(no file)";
+            var line = 0;
+            var column = 0;
+            if (tree is not null && d.Location.IsInSource)
             {
-                var tree = d.Location.SourceTree;
-                var file = tree?.FilePath ?? "(no file)";
-                var line = 0;
-                var column = 0;
-                if (tree is not null && d.Location.IsInSource)
-                {
-                    var lineSpan = d.Location.GetLineSpan();
-                    line = lineSpan.StartLinePosition.Line + 1;
-                    column = lineSpan.StartLinePosition.Character + 1;
-                }
-                var severityStr = effectiveSeverity switch
-                {
-                    DiagnosticSeverity.Error => "error",
-                    DiagnosticSeverity.Warning => "warning",
-                    DiagnosticSeverity.Info => "info",
-                    DiagnosticSeverity.Hidden => "hidden",
-                    _ => "unknown"
-                };
-                sb.AppendLineInvariant($"{file}:{line}:{column} {severityStr} {d.Id} — {d.GetMessage(CultureInfo.InvariantCulture)}");
+                var lineSpan = d.Location.GetLineSpan();
+                line = lineSpan.StartLinePosition.Line + 1;
+                column = lineSpan.StartLinePosition.Character + 1;
             }
+            var severityStr = effectiveSeverity switch
+            {
+                DiagnosticSeverity.Error => "error",
+                DiagnosticSeverity.Warning => "warning",
+                DiagnosticSeverity.Info => "info",
+                DiagnosticSeverity.Hidden => "hidden",
+                _ => "unknown"
+            };
+            items.Add(new
+            {
+                file,
+                line,
+                column,
+                severity = severityStr,
+                id = d.Id,
+                message = d.GetMessage(CultureInfo.InvariantCulture)
+            });
+        }
 
-            sb.AppendLine();
-            sb.AppendLine("# Prefer this over parsing build logs for compiler/analyzer errors.");
-            sb.AppendLine("# To fix: use file:line:column with roslyn_get_code_actions, then roslyn_apply_code_action (or fix_all_scope).");
-            sb.AppendLine();
-            if (allDiagnostics.Count == 0)
-                sb.AppendLine("(no diagnostics)");
-            else
-                sb.AppendLineInvariant($"Total: {allDiagnostics.Count}");
+        var errorCount = allDiagnostics.Count(x => x.effectiveSeverity == DiagnosticSeverity.Error);
 
-            return sb.ToString();
+        return ToolStepJson.Ok(Kind, $"shown={allDiagnostics.Count} errors={errorCount}", new
+        {
+            workspace = solutionOrProjectPath,
+            file = targetPath,
+            total_after_path = totalAfterPath,
+            excluded_severity_none = excludedSeverityNone,
+            excluded_suppress = excludedSuppress,
+            shown = allDiagnostics.Count,
+            error_count = errorCount,
+            items
+        });
     }
 }

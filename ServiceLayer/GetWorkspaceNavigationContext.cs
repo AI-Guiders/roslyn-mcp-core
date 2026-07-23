@@ -205,21 +205,8 @@ public static class GetWorkspaceNavigationContext
 
         AfterPartial:
 
-        var anchorProj = Owning(anchor);
-        if (items.Count < maxRelated && !string.IsNullOrEmpty(anchorProj))
-        {
-            foreach (var f in allCs
-                         .Where(f => !string.Equals(Path.GetFullPath(f), Path.GetFullPath(anchor), StringComparison.OrdinalIgnoreCase))
-                         .OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
-            {
-                if (items.Count >= maxRelated)
-                    break;
-                var fp = Owning(f);
-                if (!string.IsNullOrEmpty(fp) && string.Equals(fp, anchorProj, StringComparison.OrdinalIgnoreCase))
-                    AddIfNew(f, "project_peer", "Тот же проект");
-            }
-        }
-
+        // Tight structural kinds first. project_peer / broad same_namespace used to fill
+        // maxRelated before directory/tests — agent saw alpha dump («Тот же проект»).
         if (items.Count < maxRelated)
         {
             foreach (var p in FindXamlCodeBehindPairs(anchor, allCs, markupPaths))
@@ -240,6 +227,36 @@ public static class GetWorkspaceNavigationContext
             }
         }
 
+        // Wide strokes: hard cap per loose kind so one dense folder cannot eat the card.
+        // Structural kinds (partial / xaml / test) stay uncapped within maxRelated.
+        const int maxSameDirectory = 4;
+        const int maxSameNamespace = 4;
+        const int maxProjectPeer = 3;
+        var sameDirAdded = 0;
+        var sameNsAdded = 0;
+        var projectPeerAdded = 0;
+
+        if (items.Count < maxRelated)
+        {
+            var dir = Path.GetDirectoryName(anchor);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                var anchorStem = Path.GetFileNameWithoutExtension(anchor);
+                foreach (var p in allKnownFiles
+                             .Where(f => string.Equals(Path.GetDirectoryName(f), dir, StringComparison.OrdinalIgnoreCase))
+                             .OrderByDescending(f => SharedLeadingPascalTokens(anchorStem, Path.GetFileNameWithoutExtension(f)))
+                             .ThenBy(f => f, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (items.Count >= maxRelated || sameDirAdded >= maxSameDirectory)
+                        break;
+                    var before = items.Count;
+                    AddIfNew(p, "same_directory", "Тот же каталог");
+                    if (items.Count > before)
+                        sameDirAdded++;
+                }
+            }
+        }
+
         if (items.Count < maxRelated && anchorIsCs)
         {
             var anchorNs = ExtractNamespaces(anchor);
@@ -249,7 +266,7 @@ public static class GetWorkspaceNavigationContext
                              .Where(f => !string.Equals(Path.GetFullPath(f), Path.GetFullPath(anchor), StringComparison.OrdinalIgnoreCase))
                              .OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
                 {
-                    if (items.Count >= maxRelated)
+                    if (items.Count >= maxRelated || sameNsAdded >= maxSameNamespace)
                         break;
                     var ns = ExtractNamespaces(f);
                     if (!anchorNs.Overlaps(ns))
@@ -257,23 +274,31 @@ public static class GetWorkspaceNavigationContext
                     var overlap = anchorNs.Intersect(ns, StringComparer.Ordinal).FirstOrDefault();
                     if (overlap is null)
                         continue;
+                    var before = items.Count;
                     AddIfNew(f, "same_namespace", $"Тот же namespace «{overlap}»");
+                    if (items.Count > before)
+                        sameNsAdded++;
                 }
             }
         }
 
-        if (items.Count < maxRelated)
+        // Fallback only — soft-cap so loose peers never monopolize the palette.
+        var anchorProj = Owning(anchor);
+        if (items.Count < maxRelated && !string.IsNullOrEmpty(anchorProj))
         {
-            var dir = Path.GetDirectoryName(anchor);
-            if (!string.IsNullOrEmpty(dir))
+            foreach (var f in allCs
+                         .Where(f => !string.Equals(Path.GetFullPath(f), Path.GetFullPath(anchor), StringComparison.OrdinalIgnoreCase))
+                         .OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
             {
-                foreach (var p in allKnownFiles
-                             .Where(f => string.Equals(Path.GetDirectoryName(f), dir, StringComparison.OrdinalIgnoreCase))
-                             .OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+                if (items.Count >= maxRelated || projectPeerAdded >= maxProjectPeer)
+                    break;
+                var fp = Owning(f);
+                if (!string.IsNullOrEmpty(fp) && string.Equals(fp, anchorProj, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (items.Count >= maxRelated)
-                        break;
-                    AddIfNew(p, "same_directory", "Тот же каталог");
+                    var before = items.Count;
+                    AddIfNew(f, "project_peer", "Тот же проект");
+                    if (items.Count > before)
+                        projectPeerAdded++;
                 }
             }
         }
@@ -285,6 +310,13 @@ public static class GetWorkspaceNavigationContext
             exclude_kinds_effective = kindFilter.EffectiveExcludeKinds
         };
 
+        var kindCapsPayload = new
+        {
+            same_directory = maxSameDirectory,
+            same_namespace = maxSameNamespace,
+            project_peer = maxProjectPeer
+        };
+
         var payload = new
         {
             mode = "related",
@@ -293,9 +325,45 @@ public static class GetWorkspaceNavigationContext
             column,
             max_related = maxRelated,
             kind_filter = kindFilterPayload,
+            kind_caps = kindCapsPayload,
             items
         };
         return JsonSerializer.Serialize(payload, s_compactJson);
+    }
+
+    /// <summary>Leading PascalCase token overlap — sample near-name peers for directory strokes (not usages).</summary>
+    private static int SharedLeadingPascalTokens(string anchorStem, string peerStem)
+    {
+        var a = SplitPascalTokens(anchorStem);
+        var b = SplitPascalTokens(peerStem);
+        var n = 0;
+        var lim = Math.Min(a.Count, b.Count);
+        for (var i = 0; i < lim; i++)
+        {
+            if (!string.Equals(a[i], b[i], StringComparison.OrdinalIgnoreCase))
+                break;
+            n++;
+        }
+
+        return n;
+    }
+
+    private static List<string> SplitPascalTokens(string stem)
+    {
+        if (string.IsNullOrEmpty(stem))
+            return [];
+        var parts = new List<string>();
+        var start = 0;
+        for (var i = 1; i < stem.Length; i++)
+        {
+            if (!char.IsUpper(stem[i]))
+                continue;
+            parts.Add(stem[start..i]);
+            start = i;
+        }
+
+        parts.Add(stem[start..]);
+        return parts;
     }
 
     private static string BuildSubgraph(
