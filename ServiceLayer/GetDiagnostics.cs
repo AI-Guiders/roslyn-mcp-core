@@ -390,11 +390,15 @@ public static class GetDiagnostics
             var file = tree?.FilePath ?? "(no file)";
             var line = 0;
             var column = 0;
+            var endLine = 0;
+            var endColumn = 0;
             if (tree is not null && d.Location.IsInSource)
             {
                 var lineSpan = d.Location.GetLineSpan();
                 line = lineSpan.StartLinePosition.Line + 1;
                 column = lineSpan.StartLinePosition.Character + 1;
+                endLine = lineSpan.EndLinePosition.Line + 1;
+                endColumn = lineSpan.EndLinePosition.Character + 1;
             }
             var severityStr = effectiveSeverity switch
             {
@@ -409,6 +413,8 @@ public static class GetDiagnostics
                 file,
                 line,
                 column,
+                end_line = endLine,
+                end_column = endColumn,
                 severity = severityStr,
                 id = d.Id,
                 message = d.GetMessage(CultureInfo.InvariantCulture)
